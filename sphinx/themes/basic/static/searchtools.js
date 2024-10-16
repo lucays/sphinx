@@ -42,10 +42,10 @@ if (typeof Scorer === "undefined") {
 
 // Global search result kind enum, used by themes to style search results.
 class SearchResultKind {
-    static get index() { return  "index"; }
-    static get object() { return "object"; }
-    static get text() { return "text"; }
-    static get title() { return "title"; }
+  static get index() { return "index"; }
+  static get object() { return "object"; }
+  static get text() { return "text"; }
+  static get title() { return "title"; }
 }
 
 const _removeChildren = (element) => {
@@ -151,14 +151,43 @@ const _displayNextItem = (
 const _orderResultsByScoreThenName = (a, b) => {
   const leftScore = a[4];
   const rightScore = b[4];
-  if (leftScore === rightScore) {
-    // same score: sort alphabetically
-    const leftTitle = a[1].toLowerCase();
-    const rightTitle = b[1].toLowerCase();
-    if (leftTitle === rightTitle) return 0;
-    return leftTitle > rightTitle ? -1 : 1; // inverted is intentional
+  const leftTitle = a[1].toLowerCase();
+  const rightTitle = b[1].toLowerCase();
+
+  // Handle numeric titles first
+  const leftIsNumeric = !isNaN(parseFloat(leftTitle));
+  const rightIsNumeric = !isNaN(parseFloat(rightTitle));
+
+  if (leftIsNumeric && !rightIsNumeric) return -1;
+  if (!leftIsNumeric && rightIsNumeric) return 1;
+
+  // If both titles are numeric, compare dates
+  if (leftIsNumeric && rightIsNumeric) {
+    const leftDateParts = leftTitle.split('>');
+    const rightDateParts = rightTitle.split('>');
+
+    if (leftDateParts.length === 2 && rightDateParts.length === 2) {
+      const leftDateObj = createDateFromParts(leftDateParts);
+      const rightDateObj = createDateFromParts(rightDateParts);
+
+      return leftDateObj - rightDateObj; // Direct date comparison
+    }
   }
-  return leftScore > rightScore ? 1 : -1;
+
+  // Compare scores
+  if (leftScore !== rightScore) {
+    return leftScore - rightScore; // Direct score comparison
+  }
+
+  // If scores are equal, compare titles alphabetically
+  return leftTitle.localeCompare(rightTitle); // Using localeCompare for string comparison
+};
+
+// Helper function to create Date object from parts
+const createDateFromParts = (dateParts) => {
+  const year = parseInt(dateParts[0].trim());
+  const [month, day] = dateParts[1].trim().split('/').map(Number);
+  return new Date(year, month - 1, day); // month is 0-indexed
 };
 
 /**
@@ -171,8 +200,8 @@ const _orderResultsByScoreThenName = (a, b) => {
  */
 if (typeof splitQuery === "undefined") {
   var splitQuery = (query) => query
-      .split(/[^\p{Letter}\p{Number}_\p{Emoji_Presentation}]+/gu)
-      .filter(term => term)  // remove remaining empty strings
+    .split(/[^\p{Letter}\p{Number}_\p{Emoji_Presentation}]+/gu)
+    .filter(term => term)  // remove remaining empty strings
 }
 
 /**
@@ -183,14 +212,14 @@ const Search = {
   _queued_query: null,
   _pulse_status: -1,
 
-  htmlToText: (htmlString, anchor) => {
+  getInnerHTML: (htmlString, anchor) => {
     const htmlElement = new DOMParser().parseFromString(htmlString, 'text/html');
     for (const removalQuery of [".headerlink", "script", "style"]) {
       htmlElement.querySelectorAll(removalQuery).forEach((el) => { el.remove() });
     }
     if (anchor) {
       const anchorContent = htmlElement.querySelector(`[role="main"] ${anchor}`);
-      if (anchorContent) return anchorContent.textContent;
+      if (anchorContent) return anchorContent.innerHTML;
 
       console.warn(
         `Anchored content block not found. Sphinx search tries to obtain it via DOM query '[role=main] ${anchor}'. Check your theme or template.`
@@ -199,7 +228,7 @@ const Search = {
 
     // if anchor not specified or not found, fall back to main content
     const docContent = htmlElement.querySelector('[role="main"]');
-    if (docContent) return docContent.textContent;
+    if (docContent) return docContent.innerHTML;
 
     console.warn(
       "Content block not found. Sphinx search tries to obtain it via DOM query '[role=main]'. Check your theme or template."
@@ -332,15 +361,23 @@ const Search = {
 
     _removeChildren(document.getElementById("search-progress"));
 
-    const queryLower = query.toLowerCase().trim();
-    for (const [title, foundTitles] of Object.entries(allTitles)) {
-      if (title.toLowerCase().trim().includes(queryLower) && (queryLower.length >= title.length/2)) {
+    let queryLower = query.toLowerCase().trim();
+    if (queryLower.startsWith('"') && queryLower.endsWith('"')) {
+      queryLower = queryLower.substring(1, queryLower.length - 1);
+    }
+
+    const titleEntries = Object.entries(allTitles);
+    const titleLowerMap = new Map(titleEntries.map(([title]) => [title.toLowerCase().trim(), title]));
+
+    for (const [lowerTitle, originalTitle] of titleLowerMap) {
+      if (lowerTitle.includes(queryLower)) {
+        const foundTitles = allTitles[originalTitle];
         for (const [file, id] of foundTitles) {
-          const score = Math.round(Scorer.title * queryLower.length / title.length);
-          const boost = titles[file] === title ? 1 : 0;  // add a boost for document titles
+          const score = Math.round(Scorer.title * queryLower.length / originalTitle.length);
+          const boost = titles[file] === originalTitle ? 1 : 0; // add a boost for document titles
           normalResults.push([
             docNames[file],
-            titles[file] !== title ? `${titles[file]} > ${title}` : title,
+            titles[file] !== originalTitle ? `${titles[file]} > ${originalTitle.split(" ")[0]}` : originalTitle,
             id !== null ? "#" + id : "",
             null,
             score + boost,
@@ -352,10 +389,14 @@ const Search = {
     }
 
     // search for explicit entries in index directives
-    for (const [entry, foundEntries] of Object.entries(indexEntries)) {
-      if (entry.includes(queryLower) && (queryLower.length >= entry.length/2)) {
+    const indexEntriesArray = Object.entries(indexEntries);
+    const indexLowerMap = new Map(indexEntriesArray.map(([entry]) => [entry.toLowerCase(), entry]));
+
+    for (const [lowerEntry, originalEntry] of indexLowerMap) {
+      if (lowerEntry.includes(queryLower)) {
+        const foundEntries = indexEntries[originalEntry];
         for (const [file, id, isMain] of foundEntries) {
-          const score = Math.round(100 * queryLower.length / entry.length);
+          const score = Math.round(100 * queryLower.length / originalEntry.length);
           const result = [
             docNames[file],
             titles[file],
@@ -380,7 +421,7 @@ const Search = {
     );
 
     // lookup as search terms in fulltext
-    normalResults.push(...Search.performTermsSearch(searchTerms, excludedTerms));
+    // normalResults.push(...Search.performTermsSearch(searchTerms, excludedTerms));
 
     // let the scorer override scores with a custom scoring function
     if (Scorer.score) {
@@ -608,22 +649,27 @@ const Search = {
    * of stemmed words.
    */
   makeSearchSummary: (htmlText, keywords, anchor) => {
-    const text = Search.htmlToText(htmlText, anchor);
-    if (text === "") return null;
+    const innerHTML = Search.getInnerHTML(htmlText, anchor);
+    const tempContainer = document.createElement("div");
+    tempContainer.innerHTML = innerHTML;
 
-    const textLower = text.toLowerCase();
-    const actualStartPosition = [...keywords]
-      .map((k) => textLower.indexOf(k.toLowerCase()))
-      .filter((i) => i > -1)
-      .slice(-1)[0];
-    const startWithContext = Math.max(actualStartPosition - 120, 0);
+    const elements = tempContainer.querySelectorAll("p, div.line, h1, h2, h3, h4, h5, h6");
+    const matchingLines = [];
+    const keywordSet = new Set(Array.from(keywords).map(k => k.toLowerCase()));
+    elements.forEach(element => {
+      const textContent = element.textContent.trim();
+      if (textContent) {
+        if (Array.from(keywordSet).some(keyword => textContent.includes(keyword))) {
+          matchingLines.push(element.innerHTML);
+        }
+      }
+    });
 
-    const top = startWithContext === 0 ? "" : "...";
-    const tail = startWithContext + 240 < text.length ? "..." : "";
+    if (matchingLines.length === 0) return null;
 
     let summary = document.createElement("p");
     summary.classList.add("context");
-    summary.textContent = top + text.substr(startWithContext, 240).trim() + tail;
+    summary.innerHTML = "...<br>" + matchingLines.join("<br>...<br>") + "<br>...";
 
     return summary;
   },

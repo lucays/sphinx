@@ -605,18 +605,24 @@ def _feed_visit_nodes(
                 flags=re.IGNORECASE | re.DOTALL,
             )
             nodetext = re.sub(r'<[^<]+?>', '', nodetext)
+            if word_store.titles and word_store.titles[-1][0] != nodetext:
+                word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {nodetext}"
             word_store.words.extend(split(nodetext))
         return
     elif isinstance(node, nodes.meta) and _is_meta_keywords(node, language):
         keywords = [keyword.strip() for keyword in node['content'].split(',')]
+        if word_store.titles and word_store.titles[-1][0] != keywords:
+            word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {keywords}"
         word_store.words.extend(keywords)
     elif isinstance(node, nodes.Text):
+        if word_store.titles and word_store.titles[-1][0] != node.astext():
+            word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {node.astext()}"
         word_store.words.extend(split(node.astext()))
     elif isinstance(node, nodes.title):
         title, is_main_title = node.astext(), len(word_store.titles) == 0
         ids = node.parent['ids']
         title_node_id = None if is_main_title else ids[0] if ids else None
-        word_store.titles.append((title, title_node_id))
+        word_store.titles.append([title, title_node_id])
         word_store.title_words.extend(split(title))
     for child in node.children:
         _feed_visit_nodes(child, word_store=word_store, split=split, language=language)
