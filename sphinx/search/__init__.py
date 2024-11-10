@@ -335,7 +335,10 @@ class IndexBuilder:
                 if isinstance(v, int):
                     rv[k] = {index2fn[v]}
                 else:
-                    rv[k] = {index2fn[i] for i in v}
+                    try:
+                        rv[k] = {index2fn[i] for i in v}
+                    except Exception:
+                        rv[k] = set()
             return rv
 
         self._mapping = load_terms(frozen['terms'])
@@ -400,14 +403,15 @@ class IndexBuilder:
         of integers.
         """
         rvs: tuple[dict[str, list[int] | int], dict[str, list[int] | int]] = ({}, {})
-        for rv, mapping in zip(rvs, (self._mapping, self._title_mapping), strict=True):
-            for k, v in mapping.items():
-                if len(v) == 1:
-                    (fn,) = v
-                    if fn in fn2index:
-                        rv[k] = fn2index[fn]
-                else:
-                    rv[k] = sorted(fn2index[fn] for fn in v if fn in fn2index)
+        for k, v in self._mapping.items():
+            if len(v) == 1:
+                (fn,) = v
+                if fn in fn2index:
+                    rvs[0][k] = fn2index[fn]
+            else:
+                rvs[0][k] = sorted(fn2index[fn] for fn in v if fn in fn2index)
+        for k, v in self._title_mapping.items():
+            rvs[1][k] = sorted([(fn2index[fn], title, id_) for fn, title, id_ in v], key=lambda x: (fn2index[fn], x[1] or ''))
         return rvs
 
     def freeze(self) -> dict[str, Any]:
@@ -465,10 +469,9 @@ class IndexBuilder:
         self._titles = new_titles
         self._filenames = new_filenames
         self._all_titles = new_alltitles
-        for wordnames in self._mapping.values():
-            wordnames.intersection_update(docnames)
-        for wordnames in self._title_mapping.values():
-            wordnames.intersection_update(docnames)
+        if docnames:
+            for wordnames in self._mapping.values():
+                wordnames.intersection_update(docnames)
 
     def feed(
         self, docname: str, filename: str, title: str, doctree: nodes.document
@@ -489,14 +492,14 @@ class IndexBuilder:
 
         self._all_titles[docname] = word_store.titles
 
-        for word in word_store.title_words:
+        for word, node_title, node_id in word_store.title_words:
             # add stemmed and unstemmed as the stemmer must not remove words
             # from search index.
             stemmed_word = stem(word)
             if _filter(stemmed_word):
-                self._title_mapping.setdefault(stemmed_word, set()).add(docname)
+                self._title_mapping.setdefault(stemmed_word, set()).add((docname, node_title, node_id))
             elif _filter(word):
-                self._title_mapping.setdefault(word, set()).add(docname)
+                self._title_mapping.setdefault(word, set()).add((docname, node_title, node_id))
 
         for word in word_store.words:
             # add stemmed and unstemmed as the stemmer must not remove words
@@ -578,6 +581,21 @@ class IndexBuilder:
             return self.lang.js_stemmer_code
 
 
+import os
+from pathlib import Path
+work_dir = os.getcwd()
+user_dict_path = path.join(work_dir, 'dict.txt')
+user_words = dict.fromkeys([' '.join(i.split(' ')[:-2]) for i in Path(user_dict_path).read_text(encoding='utf8').split('\n')])
+
+
+def add_user_words(sentence: str, split: Callable) -> list[str]:
+    words = split(sentence)
+    if sentence in user_words:
+        words.append(sentence)
+    words = list(dict.fromkeys(words))
+    return words
+
+
 def _feed_visit_nodes(
     node: nodes.Node,
     *,
@@ -605,24 +623,27 @@ def _feed_visit_nodes(
                 flags=re.IGNORECASE | re.DOTALL,
             )
             nodetext = re.sub(r'<[^<]+?>', '', nodetext)
+            words = add_user_words(nodetext, split)
             if word_store.titles and word_store.titles[-1][0] != nodetext:
-                word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {nodetext}"
+                word_store.title_words.extend([[i, *word_store.titles[-1]] for i in words])
             word_store.words.extend(split(nodetext))
         return
     elif isinstance(node, nodes.meta) and _is_meta_keywords(node, language):
         keywords = [keyword.strip() for keyword in node['content'].split(',')]
+        words = add_user_words(keywords, split)
         if word_store.titles and word_store.titles[-1][0] != keywords:
-            word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {keywords}"
+            word_store.title_words.extend([[i, *word_store.titles[-1]] for i in words])
         word_store.words.extend(keywords)
     elif isinstance(node, nodes.Text):
+        sentence = node.astext()
+        words = add_user_words(sentence, split)
         if word_store.titles and word_store.titles[-1][0] != node.astext():
-            word_store.titles[-1][0] = f"{word_store.titles[-1][0]} {node.astext()}"
-        word_store.words.extend(split(node.astext()))
+            word_store.title_words.extend([[i, *word_store.titles[-1]] for i in words])
+        word_store.words.extend(words)
     elif isinstance(node, nodes.title):
         title, is_main_title = node.astext(), len(word_store.titles) == 0
         ids = node.parent['ids']
         title_node_id = None if is_main_title else ids[0] if ids else None
         word_store.titles.append([title, title_node_id])
-        word_store.title_words.extend(split(title))
     for child in node.children:
         _feed_visit_nodes(child, word_store=word_store, split=split, language=language)

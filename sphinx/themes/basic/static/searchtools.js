@@ -87,6 +87,7 @@ const _displayItem = (item, searchTerms, highlightTerms) => {
     requestUrl = contentRoot + docName + docFileSuffix;
     linkUrl = docName + docLinkSuffix;
   }
+  requestUrl = "https://ocg-rule.readthedocs.io/zh-cn/latest/" + linkUrl;
   let linkEl = listItem.appendChild(document.createElement("a"));
   linkEl.href = linkUrl + anchor;
   linkEl.dataset.score = score;
@@ -353,6 +354,7 @@ const Search = {
     const titles = Search._index.titles;
     const allTitles = Search._index.alltitles;
     const indexEntries = Search._index.indexentries;
+    const titleTerms = Search._index.titleterms;
 
     // Collect multiple result groups to be sorted separately and then ordered.
     // Each is an array of [docname, title, anchor, descr, score, filename, kind].
@@ -386,6 +388,19 @@ const Search = {
           ]);
         }
       }
+    }
+    for (const [file, originalTitle, id] of titleTerms[queryLower]) {
+      const score = Math.round(Scorer.title * queryLower.length / originalTitle.length);
+      const boost = titles[file] === originalTitle ? 1 : 0; // add a boost for document titles
+      normalResults.push([
+        docNames[file],
+        titles[file] !== originalTitle ? `${titles[file]} > ${originalTitle.split(" ")[0]}` : originalTitle,
+        id !== null ? "#" + id : "",
+        null,
+        score + boost,
+        filenames[file],
+        SearchResultKind.title,
+      ]);
     }
 
     // search for explicit entries in index directives
