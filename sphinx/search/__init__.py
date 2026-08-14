@@ -166,7 +166,11 @@ class _JavaScriptIndex:
     SUFFIX = ')'
 
     def dumps(self, data: Any) -> str:
-        data_json = json.dumps(data, separators=(',', ':'), sort_keys=True)
+        # keep CJK as raw UTF-8 instead of \uXXXX escapes: the per-section
+        # full-text cache would otherwise inflate several-fold
+        data_json = json.dumps(
+            data, separators=(',', ':'), sort_keys=True, ensure_ascii=False
+        )
         return self.PREFIX + data_json + self.SUFFIX
 
     def loads(self, s: str) -> Any:
@@ -201,9 +205,14 @@ def _is_meta_keywords(
 
 @dataclasses.dataclass
 class WordStore:
-    words: list[str] = dataclasses.field(default_factory=list)
     titles: list[tuple[str, str | None]] = dataclasses.field(default_factory=list)
     title_words: list[str] = dataclasses.field(default_factory=list)
+    section_words: list[tuple[str, str | None]] = dataclasses.field(
+        default_factory=list
+    )
+    # anchor -> concatenated plain text of that section (for full-text
+    # substring search of quoted CJK phrases on the client side)
+    section_text: dict[str | None, str] = dataclasses.field(default_factory=dict)
 
 
 class WordCollector(nodes.NodeVisitor):
@@ -276,10 +285,12 @@ class IndexBuilder:
         self._titles: dict[str, str | None] = env._search_index_titles
         # docname -> filename
         self._filenames: dict[str, str] = env._search_index_filenames
-        # stemmed words -> set(docname)
-        self._mapping: dict[str, set[str]] = env._search_index_mapping
         # stemmed words in titles -> set(docname)
         self._title_mapping: dict[str, set[str]] = env._search_index_title_mapping
+        # stemmed words -> set((docname, section anchor))
+        self._section_mapping: dict[str, set[tuple[str, str | None]]] = (
+            env._search_index_section_mapping
+        )
         # docname -> all titles in document
         self._all_titles: dict[str, list[tuple[str, str | None]]] = (
             env._search_index_all_titles
@@ -292,6 +303,9 @@ class IndexBuilder:
         self._objtypes: dict[tuple[str, str], int] = env._search_index_objtypes
         # objtype index -> (domain, type, objname (localized))
         self._objnames: dict[int, tuple[str, str, str]] = env._search_index_objnames
+        # docname -> anchor -> plain text of the section (for full-text
+        # substring matching of quoted CJK phrases on the client side)
+        self._section_text: dict[str, dict[str | None, str]] = {}
         # add language-specific SearchLanguage instance
         lang_class = languages.get(lang)
 
@@ -339,17 +353,26 @@ class IndexBuilder:
             for doc, titleid in doc_tuples:
                 self._all_titles[index2fn[doc]].append((title, titleid))
 
-        def load_terms(mapping: dict[str, Any]) -> dict[str, set[str]]:
-            rv = {}
-            for k, v in mapping.items():
-                if isinstance(v, int):
-                    rv[k] = {index2fn[v]}
-                else:
-                    rv[k] = {index2fn[i] for i in v}
+        def load_sections(
+            mapping: dict[str, Any],
+        ) -> dict[str, set[tuple[str, str | None]]]:
+            rv: dict[str, set[tuple[str, str | None]]] = {}
+            sections = frozen.get('sections', [])
+            for k, section_ids in mapping.items():
+                for section_id in section_ids:
+                    file_idx, anchor = sections[section_id]
+                    rv.setdefault(k, set()).add((index2fn[file_idx], anchor))
             return rv
 
-        self._mapping = load_terms(frozen['terms'])
-        self._title_mapping = load_terms(frozen['titleterms'])
+        self._section_mapping = load_sections(frozen.get('sectionterms', {}))
+        # restore the per-section plain-text cache so an incremental build can
+        # keep the full-text data of unchanged documents
+        sections = frozen.get('sections', [])
+        sectiontext = frozen.get('sectiontext', [])
+        self._section_text = {}
+        for (file_idx, anchor), text in zip(sections, sectiontext):
+            if text:
+                self._section_text.setdefault(index2fn[file_idx], {})[anchor] = text
         # no need to load keywords/objtypes
 
     def dump(
@@ -401,33 +424,11 @@ class IndexBuilder:
                 plist.append((fn2index[docname], typeindex, prio, shortanchor, name))
         return rv
 
-    def get_terms(
-        self, fn2index: dict[str, int]
-    ) -> tuple[dict[str, list[int] | int], dict[str, list[int] | int]]:
-        """Return a mapping of document and title terms to sorted document IDs.
-
-        When a term is only found within a single document,
-        then the value for that term will be an integer value.
-        When a term is found within multiple documents,
-        the value will be a list of integers.
-        """
-        rvs: tuple[dict[str, list[int] | int], dict[str, list[int] | int]] = ({}, {})
-        for rv, mapping in zip(rvs, (self._mapping, self._title_mapping), strict=True):
-            for k, v in mapping.items():
-                if len(v) == 1:
-                    (fn,) = v
-                    if fn in fn2index:
-                        rv[k] = fn2index[fn]
-                else:
-                    rv[k] = sorted(fn2index[fn] for fn in v if fn in fn2index)
-        return rvs
-
     def freeze(self) -> dict[str, Any]:
         """Create a usable data structure for serializing."""
         docnames, titles = zip(*sorted(self._titles.items()), strict=True)
         filenames = [self._filenames.get(docname) for docname in docnames]
         fn2index = {f: i for (i, f) in enumerate(docnames)}
-        terms, title_terms = self.get_terms(fn2index)
 
         objects = self.get_objects(fn2index)  # populates _objtypes
         objtypes = {v: k[0] + ':' + k[1] for (k, v) in self._objtypes.items()}
@@ -447,15 +448,42 @@ class IndexBuilder:
                     main_entry == 'main',
                 ))
 
+        # section-level full-text index: word -> list of section identifiers.
+        # Anchors tables are string-interning arrays so that a section anchor is
+        # not repeated once per distinct word inside that section.
+        unique_sections = {
+            (fn2index[docname], anchor)
+            for secs in self._section_mapping.values()
+            for docname, anchor in secs
+        }
+        sections = sorted(
+            unique_sections, key=lambda s: (s[0], s[1] is None, s[1] or '')
+        )
+        section_index = {section: i for i, section in enumerate(sections)}
+        sectionterms: dict[str, list[int]] = {}
+        for word, secs in sorted(self._section_mapping.items()):
+            word_sections = sorted(
+                {section_index[(fn2index[docname], anchor)] for docname, anchor in secs}
+            )
+            if word_sections:
+                sectionterms[word] = word_sections
+
+        sectiontext = []
+        for file_idx, anchor in sections:
+            sectiontext.append(
+                self._section_text.get(docnames[file_idx], {}).get(anchor, '')
+            )
+
         return {
             'docnames': docnames,
             'filenames': filenames,
             'titles': titles,
-            'terms': terms,
             'objects': objects,
             'objtypes': objtypes,
             'objnames': objnames,
-            'titleterms': title_terms,
+            'sections': sections,
+            'sectionterms': sectionterms,
+            'sectiontext': sectiontext,
             'envversion': self._env_version,
             'alltitles': alltitles,
             'indexentries': index_entries,
@@ -477,10 +505,21 @@ class IndexBuilder:
         self._titles = new_titles
         self._filenames = new_filenames
         self._all_titles = new_alltitles
-        for wordnames in self._mapping.values():
-            wordnames.intersection_update(docnames)
         for wordnames in self._title_mapping.values():
             wordnames.intersection_update(docnames)
+        keep = set(docnames)
+        self._section_mapping = {
+            word: {(doc, anchor) for doc, anchor in sections if doc in keep}
+            for word, sections in self._section_mapping.items()
+        }
+        self._section_mapping = {
+            word: sections for word, sections in self._section_mapping.items() if sections
+        }
+        self._section_text = {
+            docname: texts
+            for docname, texts in self._section_text.items()
+            if docname in keep
+        }
 
     def feed(
         self,
@@ -504,6 +543,7 @@ class IndexBuilder:
             return _stem(word_to_stem).lower()
 
         self._all_titles[docname] = word_store.titles
+        self._section_text[docname] = word_store.section_text
 
         for word in word_store.title_words:
             # add stemmed and unstemmed as the stemmer must not remove words
@@ -514,15 +554,19 @@ class IndexBuilder:
             elif _filter(word):
                 self._title_mapping.setdefault(word, set()).add(docname)
 
-        for word in word_store.words:
+        for word, anchor in word_store.section_words:
             # add stemmed and unstemmed as the stemmer must not remove words
             # from search index.
             stemmed_word = stem(word)
             if not _filter(stemmed_word) and _filter(word):
                 stemmed_word = word
-            already_indexed = docname in self._title_mapping.get(stemmed_word, ())
-            if _filter(stemmed_word) and not already_indexed:
-                self._mapping.setdefault(stemmed_word, set()).add(docname)
+            if _filter(stemmed_word):
+                # skip words already covered by the (title) heading search
+                if docname in self._title_mapping.get(stemmed_word, ()):
+                    continue
+                self._section_mapping.setdefault(stemmed_word, set()).add(
+                    (docname, anchor)
+                )
 
         # find explicit entries within index directives
         _index_entries: set[tuple[str, str, str]] = set()
@@ -630,13 +674,31 @@ def _feed_visit_nodes(
                 flags=re.IGNORECASE | re.DOTALL,
             )
             nodetext = re.sub(r'<[^<]+?>', '', nodetext)
-            word_store.words.extend(split(nodetext))
+            words = split(nodetext)
+            word_store.section_words.extend(
+                _anchored_words(words, word_store)
+            )
+            if nodetext.strip():
+                anchor = word_store.titles[-1][1] if word_store.titles else None
+                word_store.section_text[anchor] = (
+                    word_store.section_text.get(anchor, '')
+                    + search_norm(nodetext)
+                )
         return
     elif isinstance(node, nodes.meta) and _is_meta_keywords(node, language):
         keywords = [keyword.strip() for keyword in node['content'].split(',')]
-        word_store.words.extend(keywords)
+        word_store.section_words.extend(
+            _anchored_words(keywords, word_store)
+        )
     elif isinstance(node, nodes.Text):
-        word_store.words.extend(split(node.astext()))
+        text = node.astext()
+        words = split(text)
+        word_store.section_words.extend(_anchored_words(words, word_store))
+        if text.strip():
+            anchor = word_store.titles[-1][1] if word_store.titles else None
+            word_store.section_text[anchor] = (
+                word_store.section_text.get(anchor, '') + search_norm(text)
+            )
     elif isinstance(node, nodes.title):
         title, is_main_title = node.astext(), len(word_store.titles) == 0
         ids = node.parent['ids']
@@ -645,3 +707,34 @@ def _feed_visit_nodes(
         word_store.title_words.extend(split(title))
     for child in node.children:
         _feed_visit_nodes(child, word_store=word_store, split=split, language=language)
+
+
+def _anchored_words(
+    words: list[str], word_store: WordStore
+) -> list[tuple[str, str | None]]:
+    anchor = word_store.titles[-1][1] if word_store.titles else None
+    return [(word, anchor) for word in words]
+
+
+_NON_INDEXABLE_CHARS = re.compile(
+    r'[^\u3400-\u9fff\u3040-\u30ff\uac00-\ud7afa-zA-Z0-9]'
+)
+
+_FULLWIDTH_TO_HALFWIDTH = {
+    chr(i): chr(i - 0xFEE0) for i in range(0xFF01, 0xFF5F)
+}
+_FULLWIDTH_TO_HALFWIDTH['\u3000'] = ' '
+
+
+def search_norm(text: str) -> str:
+    """Normalize text for client-side substring matching.
+
+    Trailing/leading and *inner* whitespace plus every punctuation mark are
+    stripped so that a user searching a long effect sentence without any
+    formatting (no `「」`, `『』`, RST link tails, spaces, ...) still matches
+    against the stored contiguous run of CJK/ASCII characters. Full-width
+    ASCII letters/digits are folded to half-width and everything is lowercased
+    so that the index matches what the client normalizes queries to.
+    """
+    halfwidth = ''.join(_FULLWIDTH_TO_HALFWIDTH.get(ch, ch) for ch in text)
+    return _NON_INDEXABLE_CHARS.sub('', halfwidth).lower()

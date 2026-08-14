@@ -76,7 +76,7 @@ default_settings: dict[str, Any] = {
 
 # This is increased every time an environment attribute is added
 # or changed to properly invalidate pickle files.
-ENV_VERSION = 66
+ENV_VERSION = 67
 
 # config status
 CONFIG_UNSET = -1
@@ -218,10 +218,11 @@ class BuildEnvironment:
         self._search_index_titles: dict[str, str | None] = {}
         # docname -> filename
         self._search_index_filenames: dict[str, str] = {}
-        # stemmed words -> set(docname)
-        self._search_index_mapping: dict[str, set[str]] = {}
+
         # stemmed words in titles -> set(docname)
         self._search_index_title_mapping: dict[str, set[str]] = {}
+        # stemmed words -> set((docname, section anchor))
+        self._search_index_section_mapping: dict[str, set[tuple[str, str | None]]] = {}
         # docname -> all titles in document
         self._search_index_all_titles: dict[str, list[tuple[str, str | None]]] = {}
         # docname -> list(index entry)

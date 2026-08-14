@@ -166,14 +166,65 @@ const _displayNextItem = (
 const _orderResultsByScoreThenName = (a, b) => {
   const leftScore = a[4];
   const rightScore = b[4];
-  if (leftScore === rightScore) {
-    // same score: sort alphabetically
-    const leftTitle = a[1].toLowerCase();
-    const rightTitle = b[1].toLowerCase();
-    if (leftTitle === rightTitle) return 0;
-    return leftTitle > rightTitle ? -1 : 1; // inverted is intentional
+  const leftTitle = a[1].toLowerCase();
+  const rightTitle = b[1].toLowerCase();
+
+  // Handle numeric titles first
+  const leftIsNumeric = /^[\d\s>\/]+$/.test(leftTitle);
+  const rightIsNumeric = /^[\d\s>\/]+$/.test(rightTitle);
+
+  if (leftIsNumeric && !rightIsNumeric) return -1;
+  if (!leftIsNumeric && rightIsNumeric) return 1;
+
+  // If both titles are numeric, compare dates
+  if (leftIsNumeric && rightIsNumeric) {
+    const leftDateParts = leftTitle.split('>');
+    const rightDateParts = rightTitle.split('>');
+
+    if (leftDateParts.length === 2 && rightDateParts.length === 2) {
+      const leftDateObj = createDateFromParts(leftDateParts);
+      const rightDateObj = createDateFromParts(rightDateParts);
+
+      if (!isNaN(leftDateObj) && !isNaN(rightDateObj)) {
+        return leftDateObj - rightDateObj; // ascending; pop() below displays newest first
+      }
+    }
   }
-  return leftScore > rightScore ? 1 : -1;
+
+  // Compare scores
+  if (leftScore !== rightScore) {
+    return leftScore - rightScore; // Direct score comparison
+  }
+
+  // If scores are equal, compare titles alphabetically (in reverse order,
+  // since `_displayNextItem` pops from the end of the results array; this
+  // makes equal-scoring matches display in alphabetical order)
+  return rightTitle.localeCompare(leftTitle); // Using localeCompare for string comparison
+};
+
+// Helper function to create Date object from parts
+const createDateFromParts = (dateParts) => {
+  const year = parseInt(dateParts[0].trim());
+  const [month, day] = dateParts[1].trim().split('/').map(Number);
+  return new Date(year, month - 1, day); // month is 0-indexed
+};
+
+// Build a display title for a section result. When the section has its own
+// heading (e.g. a date like `8/8` inside a year file such as `2026`), show it
+// as `docTitle > sectionTitle` so users see exactly which entry matched and the
+// sort hook (_orderResultsByScoreThenName) can parse `year>month/day`.
+const _displayTitleFor = (file, anchor) => {
+  const docTitle = Search._index.titles[file];
+  if (anchor == null) return docTitle;
+  const allTitles = Search._index.alltitles || {};
+  for (const title of Object.keys(allTitles)) {
+    for (const [f, id] of allTitles[title]) {
+      if (f === file && id === anchor) {
+        return `${docTitle} > ${title}`;
+      }
+    }
+  }
+  return docTitle;
 };
 
 /**
@@ -185,10 +236,9 @@ const _orderResultsByScoreThenName = (a, b) => {
  * This is the same as ``\W+`` in Python, preserving the surrogate pair area.
  */
 if (typeof splitQuery === "undefined") {
-  var splitQuery = (query) =>
-    query
-      .split(/[^\p{Letter}\p{Number}_\p{Emoji_Presentation}]+/gu)
-      .filter((term) => term); // remove remaining empty strings
+  var splitQuery = (query) => query
+    .split(/[^\p{Letter}\p{Number}_\p{Emoji_Presentation}]+/gu)
+    .filter(term => term)  // remove remaining empty strings
 }
 
 /**
@@ -199,21 +249,16 @@ const Search = {
   _queued_query: null,
   _pulse_status: -1,
 
-  htmlToText: (htmlString, anchor) => {
-    const htmlElement = new DOMParser().parseFromString(
-      htmlString,
-      "text/html",
-    );
+getInnerHTML: (htmlString, anchor) => {
+    const htmlElement = new DOMParser().parseFromString(htmlString, 'text/html');
     for (const removalQuery of [".headerlink", "script", "style"]) {
       htmlElement.querySelectorAll(removalQuery).forEach((el) => {
         el.remove();
       });
     }
     if (anchor) {
-      const anchorContent = htmlElement.querySelector(
-        `[role="main"] ${anchor}`,
-      );
-      if (anchorContent) return anchorContent.textContent;
+      const anchorContent = htmlElement.querySelector(`[role="main"] ${anchor}`);
+      if (anchorContent) return anchorContent.innerHTML;
 
       console.warn(
         `Anchored content block not found. Sphinx search tries to obtain it via DOM query '[role=main] ${anchor}'. Check your theme or template.`,
@@ -222,7 +267,7 @@ const Search = {
 
     // if anchor not specified or not found, fall back to main content
     const docContent = htmlElement.querySelector('[role="main"]');
-    if (docContent) return docContent.textContent;
+    if (docContent) return docContent.innerHTML;
 
     console.warn(
       "Content block not found. Sphinx search tries to obtain it via DOM query '[role=main]'. Check your theme or template.",
@@ -311,7 +356,12 @@ const Search = {
 
       // maybe skip this "word"
       // stopwords set is from language_data.js
-      if (stopwords.has(queryTermLower) || queryTerm.match(/^\d+$/)) return;
+      if (stopwords.has(queryTermLower) || queryTerm.match(/^\d+$/)) {
+        // pure-number tokens do not take part in searching, but keep them for
+        // highlighting so quoted phrases like "超重武者 大八-8" highlight "-8"
+        if (queryTerm.match(/^\d+$/)) highlightTerms.add(queryTermLower);
+        return;
+      }
 
       // stem the word
       let word = stemmer.stemWord(queryTermLower);
@@ -361,20 +411,23 @@ const Search = {
 
     _removeChildren(document.getElementById("search-progress"));
 
-    const queryLower = query.toLowerCase().trim();
-    for (const [title, foundTitles] of Object.entries(allTitles)) {
-      if (
-        title.toLowerCase().trim().includes(queryLower)
-        && queryLower.length >= title.length / 2
-      ) {
+let queryLower = query.toLowerCase().trim();
+    if (queryLower.startsWith('"') && queryLower.endsWith('"')) {
+      queryLower = queryLower.substring(1, queryLower.length - 1);
+    }
+
+    const titleEntries = Object.entries(allTitles);
+    const titleLowerMap = new Map(titleEntries.map(([title]) => [title.toLowerCase().trim(), title]));
+
+    for (const [lowerTitle, originalTitle] of titleLowerMap) {
+      if (lowerTitle.includes(queryLower)) {
+        const foundTitles = allTitles[originalTitle];
         for (const [file, id] of foundTitles) {
-          const score = Math.round(
-            (Scorer.title * queryLower.length) / title.length,
-          );
-          const boost = titles[file] === title ? 1 : 0; // add a boost for document titles
+          const score = Math.round(Scorer.title * queryLower.length / originalTitle.length);
+          const boost = titles[file] === originalTitle ? 1 : 0; // add a boost for document titles
           normalResults.push([
             docNames[file],
-            titles[file] !== title ? `${titles[file]} > ${title}` : title,
+            titles[file] !== originalTitle ? `${titles[file]} > ${originalTitle}` : originalTitle,
             id !== null ? "#" + id : "",
             null,
             score + boost,
@@ -386,10 +439,14 @@ const Search = {
     }
 
     // search for explicit entries in index directives
-    for (const [entry, foundEntries] of Object.entries(indexEntries)) {
-      if (entry.includes(queryLower) && queryLower.length >= entry.length / 2) {
+const indexEntriesArray = Object.entries(indexEntries);
+    const indexLowerMap = new Map(indexEntriesArray.map(([entry]) => [entry.toLowerCase(), entry]));
+
+    for (const [lowerEntry, originalEntry] of indexLowerMap) {
+      if (lowerEntry.includes(queryLower)) {
+        const foundEntries = indexEntries[originalEntry];
         for (const [file, id, isMain] of foundEntries) {
-          const score = Math.round((100 * queryLower.length) / entry.length);
+          const score = Math.round(100 * queryLower.length / originalEntry.length);
           const result = [
             docNames[file],
             titles[file],
@@ -414,9 +471,43 @@ const Search = {
     );
 
     // lookup as search terms in fulltext
-    normalResults.push(
-      ...Search.performTermsSearch(searchTerms, excludedTerms),
-    );
+    normalResults.push(...Search.performSectionSearch(searchTerms, excludedTerms));
+
+    // exact full-text substring match: every query (with or without quotes)
+    // is matched verbatim against the per-section plain text shipped in the
+    // index (`sectiontext`). This makes a quoted and an unquoted search agree,
+    // catches phrases that the index-side tokenizer split into multiple words
+    // (e.g. `千查万别` -> `千查` + `万别`) while staying exact, and mirrors the
+    // whole-query normalization done on the Python side.
+    const trimmed = query.trim();
+    const quoted =
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith('“') && trimmed.endsWith('”'));
+    if (Search._index.sectiontext) {
+      const fulltextResults = Search.performFulltextSearch(
+        quoted ? trimmed : trimmed.replace(/^["'\s]+|["'\s]+$/g, ""),
+      );
+      normalResults.push(...fulltextResults);
+      // when the exact substring matched, the weak per-word tokenizer search
+      // below can only add noise (words of a longer phrase appearing separately
+      // elsewhere); keep it only as a fallback so results stay consistent with
+      // the quoted query. Deprioritize its hits by subtracting a constant so
+      // exact matches (Scorer.term) always sort above partial token hits.
+      if (fulltextResults.length > 0 && !quoted) {
+        const deprioritize = (item) => {
+          item[4] = Math.max(1, item[4] - 50);
+          return item;
+        };
+        normalResults.forEach((item) => {
+          if (item[6] === SearchResultKind.text && !fulltextResults.includes(item)) {
+            deprioritize(item);
+          }
+        });
+      }
+    } else if (quoted && normalResults.length === 0 && nonMainIndexResults.length === 0) {
+      // legacy index without sectiontext: fall back to bigram n-gram matching
+      normalResults.push(...Search.performPhraseNgramSearch(trimmed));
+    }
 
     // let the scorer override scores with a custom scoring function
     if (Scorer.score) {
@@ -547,118 +638,202 @@ const Search = {
   },
 
   /**
-   * search for full-text terms in the index
+   * search for full-text terms in the index, returning matches at the
+   * granularity of individual sections (each hit carries the section anchor).
    */
-  performTermsSearch: (searchTerms, excludedTerms) => {
-    // prepare search
-    const terms = Search._index.terms;
-    const titleTerms = Search._index.titleterms;
+  performSectionSearch: (searchTerms, excludedTerms) => {
+    const sections = Search._index.sections || [];
+    const sectionterms = Search._index.sectionterms || {};
+    const filenames = Search._index.filenames;
+    const docNames = Search._index.docnames;
+
+    // (file, anchor) -> { words: Map(word -> best score) }
+    const sectionMap = new Map();
+
+    searchTerms.forEach((word) => {
+      // find the sections containing the query word in their text term index;
+      // use Object.hasOwnProperty to avoid mismatching against prototype
+      // properties, and add support for partial matches
+      const matches = [];
+      if (sectionterms.hasOwnProperty(word)) {
+        matches.push({ ids: sectionterms[word], score: Scorer.term });
+      } else if (word.length > 2) {
+        const escapedWord = _escapeRegExp(word);
+        Object.keys(sectionterms).forEach((term) => {
+          if (term.match(escapedWord))
+            matches.push({ ids: sectionterms[term], score: Scorer.partialTerm });
+        });
+      }
+
+      // no match but word was a required one
+      if (matches.length === 0) return;
+
+      matches.forEach((match) => {
+        match.ids.forEach((sectionId) => {
+          const [file, anchor] = sections[sectionId];
+          const key = file + "\0" + anchor;
+          let record = sectionMap.get(key);
+          if (record === undefined) {
+            record = { file, anchor, words: new Map() };
+            sectionMap.set(key, record);
+          }
+          const bestScore = record.words.get(word);
+          if (bestScore === undefined || match.score > bestScore) {
+            record.words.set(word, match.score);
+          }
+        });
+      });
+    });
+
+    // as search terms with length < 3 are discarded
+    const filteredTermCount = [...searchTerms].filter(
+      (term) => term.length > 2,
+    ).length;
+
+    const results = [];
+    for (const record of sectionMap.values()) {
+      // require all search terms to be present in the same section (or all
+      // terms with length >= 3, since short terms may be skipped)
+      if (
+        record.words.size !== searchTerms.size
+        && record.words.size !== filteredTermCount
+      )
+        continue;
+
+      // ensure that none of the excluded terms is in the same section
+      if (
+        [...excludedTerms].some((term) =>
+          (sectionterms[term] || []).some(
+            (sectionId) =>
+              sections[sectionId][0] === record.file
+              && sections[sectionId][1] === record.anchor,
+          ),
+        )
+      )
+        continue;
+
+      const score = Math.max(...record.words.values());
+      results.push([
+        docNames[record.file],
+        _displayTitleFor(record.file, record.anchor),
+        record.anchor ? "#" + record.anchor : "",
+        null,
+        score,
+        filenames[record.file],
+        SearchResultKind.text,
+      ]);
+    }
+    return results;
+  },
+
+  /**
+   * Fallback search for phrases quoted with `"..."` that the term index
+   * cannot match directly (the phrase was split into multiple words by the
+   * index-side tokenizer, e.g. `千查万别` -> `千查` + `万别`).
+   *
+   * When the index ships per-section plain text (`sectiontext`), we perform an
+   * exact substring match so that a quoted phrase only matches sections whose
+   * text actually contains the full phrase.
+   */
+  performFulltextSearch: (phrase) => {
+    const sections = Search._index.sections || [];
+    const sectiontext = Search._index.sectiontext || [];
+    const filenames = Search._index.filenames;
+    const docNames = Search._index.docnames;
+
+    const clean = phrase
+      .replace(/^["'\s]+|["'\s]+$/g, "")
+      .replace(/[\uFF01-\uFF5E\u3000]/g, (ch) =>
+        ch === "\u3000" ? " " : String.fromCharCode(ch.charCodeAt(0) - 0xFEE0),
+      )
+      .toLowerCase();
+    // mirror the Python-side normalization in sphinx.search: strip every
+    // character that is not CJK / ASCII alnum so a phrase without any
+    // formatting matches the contiguous run stored in `sectiontext`.
+    const norm = clean.replace(/[^\u3400-\u9fff\u3040-\u30ff\uac00-\ud7afa-z0-9]/g, "");
+    if (!norm || norm.length < 2) return [];
+
+    const results = [];
+    for (let i = 0; i < sectiontext.length; i++) {
+      if (sectiontext[i].includes(norm)) {
+        const [file, anchor] = sections[i];
+        results.push([
+          docNames[file],
+          _displayTitleFor(file, anchor),
+          anchor ? "#" + anchor : "",
+          null,
+          Scorer.term,
+          filenames[file],
+          SearchResultKind.text,
+        ]);
+      }
+    }
+    return results;
+  },
+
+  performPhraseNgramSearch: (phrase) => {
+    const sections = Search._index.sections || [];
+    const sectionterms = Search._index.sectionterms || {};
     const filenames = Search._index.filenames;
     const docNames = Search._index.docnames;
     const titles = Search._index.titles;
 
-    const scoreMap = new Map();
-    const fileMap = new Map();
+    const clean = phrase.replace(/^["'\s]+|["'\s]+$/g, "");
+    if (!clean || clean.length < 2) return [];
 
-    // perform the search on the required terms
-    searchTerms.forEach((word) => {
-      const files = [];
-      // find documents, if any, containing the query word in their text/title term indices
-      // use Object.hasOwnProperty to avoid mismatching against prototype properties
-      const arr = [
-        {
-          files: terms.hasOwnProperty(word) ? terms[word] : undefined,
-          score: Scorer.term,
-        },
-        {
-          files: titleTerms.hasOwnProperty(word) ? titleTerms[word] : undefined,
-          score: Scorer.title,
-        },
-      ];
-      // add support for partial matches
-      if (word.length > 2) {
-        const escapedWord = _escapeRegExp(word);
-        if (!terms.hasOwnProperty(word)) {
-          Object.keys(terms).forEach((term) => {
-            if (term.match(escapedWord))
-              arr.push({ files: terms[term], score: Scorer.partialTerm });
-          });
-        }
-        if (!titleTerms.hasOwnProperty(word)) {
-          Object.keys(titleTerms).forEach((term) => {
-            if (term.match(escapedWord))
-              arr.push({ files: titleTerms[term], score: Scorer.partialTitle });
-          });
-        }
-      }
+    // build the set of bigrams that exist as terms in the index
+    const bigrams = new Set();
+    for (let i = 0; i < clean.length - 1; i++) {
+      const gram = clean.slice(i, i + 2);
+      if (sectionterms.hasOwnProperty(gram)) bigrams.add(gram);
+    }
+    if (bigrams.size === 0) return [];
 
-      // no match but word was a required one
-      if (arr.every((record) => record.files === undefined)) return;
-
-      // found search word in contents
-      arr.forEach((record) => {
-        if (record.files === undefined) return;
-
-        let recordFiles = record.files;
-        if (recordFiles.length === undefined) recordFiles = [recordFiles];
-        files.push(...recordFiles);
-
-        // set score for the word in each file
-        recordFiles.forEach((file) => {
-          if (!scoreMap.has(file)) scoreMap.set(file, new Map());
-          const fileScores = scoreMap.get(file);
-          fileScores.set(word, record.score);
-        });
-      });
-
-      // create the mapping
-      files.forEach((file) => {
-        if (!fileMap.has(file)) fileMap.set(file, [word]);
-        else if (fileMap.get(file).indexOf(word) === -1)
-          fileMap.get(file).push(word);
+    // collect sections and how many distinct bigrams they contain
+    const sectionHitCount = new Map(); // sectionId -> count of distinct bigrams
+    const sectionWordScores = new Map(); // sectionId -> max term score
+    bigrams.forEach((gram) => {
+      sectionterms[gram].forEach((sectionId) => {
+        sectionHitCount.set(sectionId, (sectionHitCount.get(sectionId) || 0) + 1);
+        const cur = sectionWordScores.get(sectionId) || 0;
+        sectionWordScores.set(sectionId, Math.max(cur, Scorer.term));
       });
     });
 
-    // now check if the files don't contain excluded terms
-    const results = [];
-    for (const [file, wordList] of fileMap) {
-      // check if all requirements are matched
-
-      // as search terms with length < 3 are discarded
-      const filteredTermCount = [...searchTerms].filter(
-        (term) => term.length > 2,
-      ).length;
-      if (
-        wordList.length !== searchTerms.size
-        && wordList.length !== filteredTermCount
-      )
-        continue;
-
-      // ensure that none of the excluded terms is in the search result
-      if (
-        [...excludedTerms].some(
-          (term) =>
-            terms[term] === file
-            || titleTerms[term] === file
-            || (terms[term] || []).includes(file)
-            || (titleTerms[term] || []).includes(file),
-        )
-      )
-        break;
-
-      // select one (max) score for the file.
-      const score = Math.max(...wordList.map((w) => scoreMap.get(file).get(w)));
-      // add result to the result list
-      results.push([
+    // A phrase of length N has N-1 bigrams. Bigrams that are not present as
+    // index terms at all cannot match, so the achievable maximum is
+    // bigrams.size. Short phrases (card names) match with a looser ratio;
+    // long phrases (effect text) need dense coverage so that only sections
+    // actually containing most of the phrase survive.
+    const ratio = clean.length <= 6 ? 0.6 : 0.8;
+    const minHits = Math.max(2, Math.ceil(bigrams.size * ratio));
+    const candidates = [];
+    sectionHitCount.forEach((count, sectionId) => {
+      if (count < minHits) return;
+      const [file, anchor] = sections[sectionId];
+      candidates.push([
+        count,
         docNames[file],
         titles[file],
-        "",
+        anchor ? "#" + anchor : "",
+        sectionWordScores.get(sectionId) || Scorer.partialTerm,
+        filenames[file],
+      ]);
+    });
+    // keep the most relevant sections (highest bigram coverage) and cap the
+    // result size to avoid flooding the page with loose partial matches
+    candidates.sort((a, b) => b[0] - a[0]);
+    const results = candidates
+      .slice(0, 50)
+      .map(([count, docName, title, anchorStr, score, filename]) => [
+        docName,
+        title,
+        anchorStr,
         null,
         score,
-        filenames[file],
+        filename,
         SearchResultKind.text,
       ]);
-    }
     return results;
   },
 
@@ -668,23 +843,27 @@ const Search = {
    * of stemmed words.
    */
   makeSearchSummary: (htmlText, keywords, anchor) => {
-    const text = Search.htmlToText(htmlText, anchor);
-    if (text === "") return null;
+    const innerHTML = Search.getInnerHTML(htmlText, anchor);
+    const tempContainer = document.createElement("div");
+    tempContainer.innerHTML = innerHTML;
 
-    const textLower = text.toLowerCase();
-    const actualStartPosition = [...keywords]
-      .map((k) => textLower.indexOf(k.toLowerCase()))
-      .filter((i) => i > -1)
-      .slice(-1)[0];
-    const startWithContext = Math.max(actualStartPosition - 120, 0);
+    const elements = tempContainer.querySelectorAll("p, div.line, h1, h2, h3, h4, h5, h6");
+    const matchingLines = [];
+    const keywordSet = new Set(Array.from(keywords).map(k => k.toLowerCase()));
+    elements.forEach(element => {
+      const textContent = element.textContent.trim();
+      if (textContent) {
+        if (Array.from(keywordSet).some(keyword => textContent.includes(keyword))) {
+          matchingLines.push(element.innerHTML);
+        }
+      }
+    });
 
-    const top = startWithContext === 0 ? "" : "...";
-    const tail = startWithContext + 240 < text.length ? "..." : "";
+    if (matchingLines.length === 0) return null;
 
     let summary = document.createElement("p");
     summary.classList.add("context");
-    summary.textContent =
-      top + text.substr(startWithContext, 240).trim() + tail;
+    summary.innerHTML = "...<br>" + matchingLines.join("<br>...<br>") + "<br>...";
 
     return summary;
   },

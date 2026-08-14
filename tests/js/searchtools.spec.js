@@ -28,7 +28,7 @@ describe("Basic html theme search", function () {
     expect(nextExpected).toEqual(undefined);
   }
 
-  describe("terms search", function () {
+  describe("section terms search", function () {
     it('should find "C++" when in index', function () {
       eval(loadFixture("cpp/searchindex.js"));
 
@@ -45,44 +45,34 @@ describe("Basic html theme search", function () {
         "index.rst",
         "text"
       ]];
-      expect(Search.performTermsSearch(searchterms, excluded)).toEqual(hits);
+      expect(Search.performSectionSearch(searchterms, excluded)).toEqual(hits);
     });
 
     it("should be able to search for multiple terms", function () {
       eval(loadFixture("multiterm/searchindex.js"));
 
       [_searchQuery, searchterms, excluded, ..._remainingItems] =
-        Search._parseQuery("main page");
+        Search._parseQuery("adjacent order");
       // prettier-ignore
       hits = [[
         'index',
         'Main Page',
         '',
         null,
-        15,
+        5,
         'index.rst',
         'text'
       ]];
-      expect(Search.performTermsSearch(searchterms, excluded)).toEqual(hits);
+      expect(Search.performSectionSearch(searchterms, excluded)).toEqual(hits);
     });
 
-    it('should partially-match "sphinx" when in title index', function () {
+    it("should not match a title-only word in the section index", function () {
       eval(loadFixture("partial/searchindex.js"));
 
       [_searchQuery, searchterms, excluded, ..._remainingItems] =
         Search._parseQuery("sphinx");
 
-      // prettier-ignore
-      hits = [[
-        "index",
-        "sphinx_utils module",
-        "",
-        null,
-        7,
-        "index.rst",
-        "text"
-      ]];
-      expect(Search.performTermsSearch(searchterms, excluded)).toEqual(hits);
+      expect(Search.performSectionSearch(searchterms, excluded)).toEqual([]);
     });
 
     it('should partially-match within "possible" when in term index', function () {
@@ -90,8 +80,6 @@ describe("Basic html theme search", function () {
 
       [_searchQuery, searchterms, excluded, ..._remainingItems] =
         Search._parseQuery("ossibl");
-      terms = Search._index.terms;
-      titleterms = Search._index.titleterms;
 
       // prettier-ignore
       hits = [[
@@ -104,7 +92,7 @@ describe("Basic html theme search", function () {
         "text"
       ]];
       expect(
-        Search.performTermsSearch(searchterms, excluded, terms, titleterms),
+        Search.performSectionSearch(searchterms, excluded),
       ).toEqual(hits);
     });
   });
@@ -235,7 +223,7 @@ describe("Basic html theme search", function () {
   });
 });
 
-describe("htmlToText", function () {
+describe("getInnerHTML", function () {
   const testHTML = `<html>
   <body>
     <script src="directory/filename.js"></script>
@@ -267,7 +255,9 @@ describe("htmlToText", function () {
   </html>`;
 
   it("basic case", () => {
-    expect(Search.htmlToText(testHTML).trim().split(/\s+/)).toEqual(
+    expect(
+      Search.getInnerHTML(testHTML).replace(/<[^>]+>/g, " ").trim().split(/\s+/),
+    ).toEqual(
       /* prettier-ignore */ [
       "Getting", "Started", "Some", "text",
       "Other", "Section", "Other", "text",
@@ -278,7 +268,10 @@ describe("htmlToText", function () {
 
   it("will start reading from the anchor", () => {
     expect(
-      Search.htmlToText(testHTML, "#other-section").trim().split(/\s+/),
+      Search.getInnerHTML(testHTML, "#other-section")
+        .replace(/<[^>]+>/g, " ")
+        .trim()
+        .split(/\s+/),
     ).toEqual(["Other", "Section", "Other", "text"]);
   });
 });

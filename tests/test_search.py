@@ -73,11 +73,11 @@ def load_searchindex(path: Path) -> Any:
 
 
 def is_registered_term(index: Any, keyword: str) -> bool:
-    return index['terms'].get(keyword, []) != []
+    return index['sectionterms'].get(keyword, []) != []
 
 
 def is_registered_prefix(index: Any, prefix: str) -> bool:
-    terms = index['terms']
+    terms = index['sectionterms']
     return any(k.startswith(prefix) and v != [] for k, v in terms.items())
 
 
@@ -155,12 +155,12 @@ def test_stemmer(app: SphinxTestApp) -> None:
 @pytest.mark.sphinx('html', testroot='search')
 def test_term_in_heading_and_section(app: SphinxTestApp) -> None:
     app.build(force_all=True)
-    searchindex = (app.outdir / 'searchindex.js').read_text(encoding='utf8')
-    # if search term is in the title of one doc and in the text of another
-    # both documents should be a hit in the search index as a title,
-    # respectively text hit
-    assert '"textinhead":3' in searchindex
-    assert '"textinhead":1' in searchindex
+    index = load_searchindex(app.outdir / 'searchindex.js')
+    # 'textinheading' is a section heading in one document and body text in
+    # another. The heading is covered by the title index (via .alltitles)
+    # while the body occurrence is indexed as a section term.
+    assert 'textinheading' in index['alltitles']
+    assert is_registered_term(index, 'textinhead')
 
 
 @pytest.mark.sphinx('html', testroot='search')
@@ -223,19 +223,44 @@ def test_IndexBuilder():
         'docname2_2': 'filename2_2',
     }
     # note: element iteration order (sort order) is important when the index
-    # is frozen (serialized) during build -- however, the _mapping-related
-    # dictionaries below may be iterated in arbitrary order by Python at
-    # runtime.
-    assert index._mapping == {
-        'fermion': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
-        'comment': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
-        'non': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
-        'index': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
-        'test': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
-    }
+    # is frozen (serialized) during build -- however, the _title_mapping and
+    # _section_mapping dictionaries below may be iterated in arbitrary order
+    # by Python at runtime.
     assert index._title_mapping == {
         'another_titl': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
         'section_titl': {'docname1_1', 'docname1_2', 'docname2_1', 'docname2_2'},
+    }
+    assert index._section_mapping == {
+        'comment': {
+            ('docname1_1', 'another-title'),
+            ('docname1_2', 'another-title'),
+            ('docname2_1', 'another-title'),
+            ('docname2_2', 'another-title'),
+        },
+        'fermion': {
+            ('docname1_1', 'another-title'),
+            ('docname1_2', 'another-title'),
+            ('docname2_1', 'another-title'),
+            ('docname2_2', 'another-title'),
+        },
+        'index': {
+            ('docname1_1', 'another-title'),
+            ('docname1_2', 'another-title'),
+            ('docname2_1', 'another-title'),
+            ('docname2_2', 'another-title'),
+        },
+        'non': {
+            ('docname1_1', 'another-title'),
+            ('docname1_2', 'another-title'),
+            ('docname2_1', 'another-title'),
+            ('docname2_2', 'another-title'),
+        },
+        'test': {
+            ('docname1_1', 'another-title'),
+            ('docname1_2', 'another-title'),
+            ('docname2_1', 'another-title'),
+            ('docname2_2', 'another-title'),
+        },
     }
     assert index._objtypes == {}
     assert index._objnames == {}
@@ -256,7 +281,13 @@ def test_IndexBuilder():
             1: ('dummy2', 'objtype1', 'objtype1'),
         },
         'objtypes': {0: 'dummy1:objtype1', 1: 'dummy2:objtype1'},
-        'terms': {
+        'sections': [
+            (0, 'another-title'),
+            (1, 'another-title'),
+            (2, 'another-title'),
+            (3, 'another-title'),
+        ],
+        'sectionterms': {
             'comment': [0, 1, 2, 3],
             'fermion': [0, 1, 2, 3],
             'index': [0, 1, 2, 3],
@@ -264,10 +295,6 @@ def test_IndexBuilder():
             'test': [0, 1, 2, 3],
         },
         'titles': ('title1_1', 'title1_2', 'title2_1', 'title2_2'),
-        'titleterms': {
-            'another_titl': [0, 1, 2, 3],
-            'section_titl': [0, 1, 2, 3],
-        },
         'alltitles': {
             'another_title': [
                 (0, 'another-title'),
@@ -297,8 +324,10 @@ def test_IndexBuilder():
 
     assert index2._titles == index._titles
     assert index2._filenames == index._filenames
-    assert index2._mapping == index._mapping
-    assert index2._title_mapping == index._title_mapping
+    # titles/title_words are only populated while feeding new documents; on
+    # load the full-text index is restored via ._section_mapping
+    assert index2._title_mapping == {}
+    assert index2._section_mapping == index._section_mapping
     assert index2._objtypes == {}
     assert index2._objnames == {}
 
@@ -314,16 +343,16 @@ def test_IndexBuilder():
         'docname1_2': 'filename1_2',
         'docname2_2': 'filename2_2',
     }
-    assert index._mapping == {
-        'fermion': {'docname1_2', 'docname2_2'},
-        'comment': {'docname1_2', 'docname2_2'},
-        'non': {'docname1_2', 'docname2_2'},
-        'index': {'docname1_2', 'docname2_2'},
-        'test': {'docname1_2', 'docname2_2'},
-    }
     assert index._title_mapping == {
         'another_titl': {'docname1_2', 'docname2_2'},
         'section_titl': {'docname1_2', 'docname2_2'},
+    }
+    assert index._section_mapping == {
+        'comment': {('docname1_2', 'another-title'), ('docname2_2', 'another-title')},
+        'fermion': {('docname1_2', 'another-title'), ('docname2_2', 'another-title')},
+        'index': {('docname1_2', 'another-title'), ('docname2_2', 'another-title')},
+        'non': {('docname1_2', 'another-title'), ('docname2_2', 'another-title')},
+        'test': {('docname1_2', 'another-title'), ('docname2_2', 'another-title')},
     }
     assert index._objtypes == {('dummy1', 'objtype1'): 0, ('dummy2', 'objtype1'): 1}
     assert index._objnames == {
@@ -342,7 +371,11 @@ def test_IndexBuilder():
             1: ('dummy2', 'objtype1', 'objtype1'),
         },
         'objtypes': {0: 'dummy1:objtype1', 1: 'dummy2:objtype1'},
-        'terms': {
+        'sections': [
+            (0, 'another-title'),
+            (1, 'another-title'),
+        ],
+        'sectionterms': {
             'comment': [0, 1],
             'fermion': [0, 1],
             'index': [0, 1],
@@ -350,10 +383,6 @@ def test_IndexBuilder():
             'test': [0, 1],
         },
         'titles': ('title1_2', 'title2_2'),
-        'titleterms': {
-            'another_titl': [0, 1],
-            'section_titl': [0, 1],
-        },
         'alltitles': {
             'another_title': [(0, 'another-title'), (1, 'another-title')],
             'section_title': [(0, None), (1, None)],
@@ -388,10 +417,10 @@ def test_IndexBuilder_lookup():
 def test_search_index_gen_zh(app: SphinxTestApp) -> None:
     app.build(force_all=True)
     index = load_searchindex(app.outdir / 'searchindex.js')
-    assert 'chinesetest ' not in index['terms']
-    assert 'chinesetest' in index['terms']
-    assert 'chinesetesttwo' in index['terms']
-    assert 'cas' in index['terms']
+    assert 'chinesetest ' not in index['sectionterms']
+    assert 'chinesetest' in index['sectionterms']
+    assert 'chinesetesttwo' in index['sectionterms']
+    assert 'cas' in index['sectionterms']
 
     language_data = (app.outdir / '_static' / 'language_data.js').read_text(
         encoding='utf-8'
@@ -430,13 +459,13 @@ def test_nosearch(app: SphinxTestApp) -> None:
     index = load_searchindex(app.outdir / 'searchindex.js')
     assert index['docnames'] == ['escapedtitle', 'index', 'nosearch', 'tocitem']
     # latex is in 'nosearch.rst', and nowhere else
-    assert 'latex' not in index['terms']
+    assert 'latex' not in index['sectionterms']
     # cat is in 'index.rst' but is marked with the 'no-search' class
-    assert 'cat' not in index['terms']
-    # bat is indexed from 'index.rst' and 'tocitem.rst' (document IDs 0, 2), and
-    # not from 'nosearch.rst' (document ID 1)
-    assert 'bat' in index['terms']
-    assert index['terms']['bat'] == [1, 3]
+    assert 'cat' not in index['sectionterms']
+    # bat is indexed from 'index.rst' and 'tocitem.rst' (section identifiers 1, 4),
+    # and not from 'nosearch.rst' (which is excluded from the search index)
+    assert 'bat' in index['sectionterms']
+    assert index['sectionterms']['bat'] == [1, 4]
 
 
 @pytest.mark.sphinx(
@@ -479,6 +508,10 @@ def assert_is_sorted(
         # Each element of .filenames is related to the element of .docnames in the same position.
         # The ordering is deterministic because .docnames is sorted.
         '.filenames',
+        # .sections is a string-interning table (docindex, anchor). Its order is
+        # explicitly built by the search index builder and is not required to be
+        # sorted; anchors may mix strings and nulls per document.
+        '.sections',
     }
 
     err_path = path or '<root>'
